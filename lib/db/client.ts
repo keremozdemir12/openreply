@@ -23,6 +23,9 @@ function createPrismaClient() {
       connectionString: databaseUrl,
       max: Number(process.env.DB_POOL_MAX ?? 3),
       idleTimeoutMillis: 10_000,
+    }, {
+      // Optional: run in a non-public schema (e.g. sharing a Supabase project).
+      schema: process.env.DB_SCHEMA || undefined,
     }),
   });
 }
