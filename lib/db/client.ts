@@ -1,5 +1,6 @@
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/app/generated/prisma/client";
+import { SUPABASE_ROOT_2021_CA } from "./supabase-ca";
 
 const globalForPrisma = globalThis as unknown as {
   prisma?: PrismaClient;
@@ -18,9 +19,19 @@ function createPrismaClient() {
   // "Can't reach database server", which reads like an outage rather than an
   // exhausted pool. The cap is per-environment: small on Vercel, a bit higher
   // on the worker, which is a single long-lived process.
+  // Optional: verify Supabase's TLS chain against its published root CA.
+  // node-postgres treats sslmode=require as full verification, which fails on
+  // Supabase's private CA, and URL ssl params override the `ssl` option, so the
+  // param is dropped from the URL when the CA is supplied here.
+  const supabaseCa = process.env.DB_SSL_CA === "supabase-2021";
+  const connectionString = supabaseCa
+    ? databaseUrl.replace(/([?&])sslmode=[^&]*&?/, "$1").replace(/[?&]$/, "")
+    : databaseUrl;
+
   return new PrismaClient({
     adapter: new PrismaPg({
-      connectionString: databaseUrl,
+      connectionString,
+      ...(supabaseCa ? { ssl: { ca: SUPABASE_ROOT_2021_CA } } : {}),
       max: Number(process.env.DB_POOL_MAX ?? 3),
       idleTimeoutMillis: 10_000,
     }, {
