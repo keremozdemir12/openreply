@@ -107,12 +107,18 @@ export async function seedTapProbes(): Promise<number> {
   const prompts = await prisma.dmLog.findMany({
     where: {
       createdAt: { gt: since },
-      NOT: [
-        { commentId: { startsWith: "reveal:" } },
+      NOT: { commentId: { startsWith: "reveal:" } },
+      AND: [
+        { OR: [{ status: "SENT" }, { dmDeliveryUnconfirmed: true }] },
         // Another app already replied privately; this prompt never went out.
-        { errorMessage: { contains: "already has a reply" } },
+        // (A bare NOT on a nullable column also drops the NULL rows.)
+        {
+          OR: [
+            { errorMessage: null },
+            { NOT: { errorMessage: { contains: "already has a reply" } } },
+          ],
+        },
       ],
-      OR: [{ status: "SENT" }, { dmDeliveryUnconfirmed: true }],
       automation: { isActive: true, requireFollow: true },
     },
     select: {
