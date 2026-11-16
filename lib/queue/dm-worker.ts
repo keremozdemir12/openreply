@@ -82,6 +82,104 @@ const FOLLOW_RECHECK_TOTAL_MS = FOLLOW_RECHECK_DELAYS_MS.reduce(
   0
 );
 
+// Tap probe schedule: frequent at first (people tap within seconds or
+// minutes), then sparse until the 24-hour window would have closed anyway.
+// Set FOLLOW_TAP_PROBE=0 to disable (e.g. once Advanced Access delivers
+// postback webhooks).
+const TAP_PROBE_ENABLED = process.env.FOLLOW_TAP_PROBE !== "0";
+const TAP_PROBE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+function nextTapProbeDelay(elapsedMs: number): number | null {
+  if (elapsedMs < 10 * 60 * 1000) return 30 * 1000;
+  if (elapsedMs < 60 * 60 * 1000) return 2 * 60 * 1000;
+  if (elapsedMs < TAP_PROBE_MAX_AGE_MS) return 15 * 60 * 1000;
+  return null;
+}
+
+/**
+ * On boot, start probes for follow prompts sent in the last 24 hours that have
+ * no reveal yet (prompts sent before probing existed, or by a worker that went
+ * down). The fixed "seed" job id keeps a restart from doubling a chain.
+ */
+export async function seedTapProbes(): Promise<number> {
+  if (!TAP_PROBE_ENABLED) return 0;
+  const since = new Date(Date.now() - TAP_PROBE_MAX_AGE_MS);
+  const prompts = await prisma.dmLog.findMany({
+    where: {
+      createdAt: { gt: since },
+      NOT: [
+        { commentId: { startsWith: "reveal:" } },
+        // Another app already replied privately; this prompt never went out.
+        { errorMessage: { contains: "already has a reply" } },
+      ],
+      OR: [{ status: "SENT" }, { dmDeliveryUnconfirmed: true }],
+      automation: { isActive: true, requireFollow: true },
+    },
+    select: {
+      automationId: true,
+      instagramAccountId: true,
+      commenterId: true,
+      createdAt: true,
+      instagramAccount: { select: { instagramId: true } },
+    },
+  });
+  let seeded = 0;
+  for (const prompt of prompts) {
+    const revealed = await prisma.dmLog.findUnique({
+      where: {
+        automationId_commentId: {
+          automationId: prompt.automationId,
+          commentId: `reveal:${prompt.commenterId}`,
+        },
+      },
+      select: { status: true, dmDeliveryUnconfirmed: true },
+    });
+    if (revealed?.status === "SENT" || revealed?.dmDeliveryUnconfirmed) continue;
+    await scheduleTapProbe(
+      {
+        accountConnectionId: prompt.instagramAccountId,
+        instagramAccountId: prompt.instagramAccount.instagramId,
+        userId: prompt.commenterId,
+        payload: `followcheck:${prompt.automationId}`,
+        probeStartedAt: prompt.createdAt.getTime(),
+      },
+      { jobIdSuffix: "seed" }
+    );
+    seeded++;
+  }
+  return seeded;
+}
+
+export async function scheduleTapProbe(
+  data: Pick<ProcessPostbackJob, "accountConnectionId" | "instagramAccountId" | "userId" | "payload"> & {
+    probeAttempt?: number;
+    probeStartedAt?: number;
+  },
+  options: { jobIdSuffix?: string } = {}
+): Promise<void> {
+  if (!TAP_PROBE_ENABLED) return;
+  const startedAt = data.probeStartedAt ?? Date.now();
+  const attempt = data.probeAttempt ?? 0;
+  const delay = nextTapProbeDelay(Date.now() - startedAt);
+  if (delay === null) return;
+  await getDMQueue().add(
+    POSTBACK_JOB_NAME,
+    {
+      accountConnectionId: data.accountConnectionId,
+      instagramAccountId: data.instagramAccountId,
+      userId: data.userId,
+      payload: data.payload,
+      probe: true,
+      probeAttempt: attempt + 1,
+      probeStartedAt: startedAt,
+    },
+    {
+      delay,
+      jobId: `tapprobe_${data.payload.replace(/:/g, "_")}_${data.userId}_${options.jobIdSuffix ?? attempt + 1}`,
+    }
+  );
+}
+
 /**
  * Sends Meta answered with an error but may well have delivered anyway.
  *
@@ -779,12 +877,32 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           errorMessage: null,
         },
       });
+      if (sendFollowPrompt) {
+        await scheduleTapProbe({
+          accountConnectionId: automation.instagramAccountId,
+          instagramAccountId: automation.instagramAccount.instagramId,
+          userId: commenterId,
+          payload: `followcheck:${automation.id}`,
+        }).catch((probeError) =>
+          console.log("[DM Worker] Failed to schedule tap probe:", formatError(probeError))
+        );
+      }
     } catch (error) {
       const sendError = classifySendError(error);
       // Retain reservations if the provider may have delivered the message.
       if (isConfirmedSendRejection(sendError)) {
         if (rateLimit?.reserved) await releaseDMSlot(instagramAccountId);
         await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
+      }
+      // A code 1/2 on the follow prompt usually means it arrived anyway, so
+      // the person can still tap its button: keep watching for the tap.
+      if (sendFollowPrompt && isDeliveryUnconfirmed(sendError)) {
+        await scheduleTapProbe({
+          accountConnectionId: automation.instagramAccountId,
+          instagramAccountId: automation.instagramAccount.instagramId,
+          userId: commenterId,
+          payload: `followcheck:${automation.id}`,
+        }).catch(() => {});
       }
       await prisma.dmLog.update({
         where: { automationId_commentId: { automationId: automation.id, commentId } },
@@ -887,7 +1005,7 @@ async function sendFollowRecheckAck({
  * IGSID (same id as their comment author id), which we DM directly.
  */
 async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
-  const { instagramAccountId, userId, payload, fallback } = job.data;
+  const { instagramAccountId, userId, payload, fallback, probe } = job.data;
 
   const isFollowCheck = payload.startsWith("followcheck:");
   if (!isFollowCheck && !payload.startsWith("reveal:")) return;
@@ -922,7 +1040,7 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
   // instead of only firing once per person.
   const dedupeId = `reveal:${userId}`;
 
-  if (fallback) {
+  if (fallback || probe) {
     const existingReveal = await prisma.dmLog.findUnique({
       where: {
         automationId_commentId: {
@@ -970,7 +1088,18 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
   // be bypassable by just reading the DM and waiting. On a tap, following or
   // unverifiable (null) falls through and delivers the link — fail-open so a
   // real follower is never trapped.
-  if ((isFollowCheck || fallback) && automation.requireFollow) {
+  if (probe && automation.requireFollow) {
+    // A probe cannot tell a tap from no tap until the send itself succeeds,
+    // so only a confirmed non-follower waits for the next probe.
+    const follows = await getUserFollowStatus({
+      context: accessToken,
+      recipientId: userId,
+    });
+    if (follows === false) {
+      await scheduleTapProbe(job.data);
+      return;
+    }
+  } else if ((isFollowCheck || fallback) && automation.requireFollow) {
     const follows = await getUserFollowStatus({
       context: accessToken,
       recipientId: userId,
@@ -1181,6 +1310,12 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
     // failure the user can act on — so don't log it as FAILED and don't retry
     // it against a window that cannot reopen on its own. It still delivers in
     // the case that does work: the user replied by typing instead of tapping.
+    // A probe's closed window means "not tapped yet": try again later.
+    if (probe && !isDeliveryUnconfirmed(error)) {
+      await scheduleTapProbe(job.data);
+      return;
+    }
+
     if (fallback && !isDeliveryUnconfirmed(error)) {
       console.log(
         "[DM Worker] Read fallback not delivered (messaging window closed):",

@@ -845,6 +845,120 @@ describe("DM Worker — Full Pipeline", () => {
     );
   });
 
+  it("should schedule a tap probe after sending a follow-gate prompt", async () => {
+    mockGetUserFollowStatus.mockResolvedValue(null); // unverifiable (Standard Access)
+    mockPrisma.automation.findMany.mockResolvedValue([
+      { ...mockAutomation, requireFollow: true, trackedLinks: [] },
+    ]);
+
+    const processor = getProcessor();
+    await processor(createMockJob());
+
+    expect(mockSendPrivateReplyWithButton).toHaveBeenCalled();
+    expect(mockQueueAdd).toHaveBeenCalledWith(
+      "process-postback",
+      expect.objectContaining({
+        payload: "followcheck:auto_789",
+        probe: true,
+        probeAttempt: 1,
+      }),
+      expect.objectContaining({ delay: 30_000 })
+    );
+  });
+
+  it("should re-schedule a tap probe while the messaging window is still closed", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([]);
+    mockPrisma.automation.findFirst.mockResolvedValue({
+      ...mockAutomation,
+      requireFollow: true,
+      trackedLinks: [],
+    });
+    mockGetUserFollowStatus.mockResolvedValue(null);
+    mockSendDirectMessage.mockRejectedValue(
+      new MetaApiError(10, undefined, undefined, "This message is sent outside of allowed window.")
+    );
+
+    const processor = getProcessor();
+    await expect(
+      processor(
+        createMockPostbackJob({
+          instagramAccountId: "ig_456",
+          userId: "commenter_999",
+          payload: "followcheck:auto_789",
+          probe: true,
+          probeAttempt: 1,
+          probeStartedAt: Date.now(),
+        })
+      )
+    ).resolves.toBeUndefined();
+
+    expect(mockPrisma.dmLog.upsert).not.toHaveBeenCalled();
+    expect(mockQueueAdd).toHaveBeenCalledWith(
+      "process-postback",
+      expect.objectContaining({ probe: true, probeAttempt: 2 }),
+      expect.objectContaining({ delay: 30_000 })
+    );
+  });
+
+  it("should deliver the link from a tap probe once the window is open", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([]);
+    mockPrisma.automation.findFirst.mockResolvedValue({
+      ...mockAutomation,
+      requireFollow: true,
+      trackedLinks: [],
+    });
+    mockGetUserFollowStatus.mockResolvedValue(null);
+
+    const processor = getProcessor();
+    await processor(
+      createMockPostbackJob({
+        instagramAccountId: "ig_456",
+        userId: "commenter_999",
+        payload: "followcheck:auto_789",
+        probe: true,
+        probeAttempt: 3,
+        probeStartedAt: Date.now(),
+      })
+    );
+
+    expect(mockSendDirectMessage).toHaveBeenCalledWith(
+      "decrypted_token",
+      "ig_456",
+      "commenter_999",
+      "Hey commenter_user! Here is the link: https://example.com"
+    );
+    expect(mockQueueAdd).not.toHaveBeenCalledWith(
+      "process-postback",
+      expect.objectContaining({ probe: true }),
+      expect.anything()
+    );
+  });
+
+  it("should stop probing once the reveal was already sent", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([]);
+    mockPrisma.automation.findFirst.mockResolvedValue({
+      ...mockAutomation,
+      requireFollow: true,
+      trackedLinks: [],
+    });
+    mockPrisma.dmLog.findUnique.mockResolvedValue({ status: "SENT" });
+
+    const processor = getProcessor();
+    await processor(
+      createMockPostbackJob({
+        instagramAccountId: "ig_456",
+        userId: "commenter_999",
+        payload: "followcheck:auto_789",
+        probe: true,
+        probeAttempt: 2,
+        probeStartedAt: Date.now(),
+      })
+    );
+
+    expect(mockSendDirectMessage).not.toHaveBeenCalled();
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+  });
+
   it("should not log a failure when a read fallback hits a closed messaging window", async () => {
     mockPrisma.automation.findMany.mockResolvedValue([]);
     mockPrisma.automation.findFirst.mockResolvedValue({

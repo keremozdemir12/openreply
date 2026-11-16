@@ -1,4 +1,4 @@
-import { createDMWorker } from "@/lib/queue/dm-worker";
+import { createDMWorker, seedTapProbes } from "@/lib/queue/dm-worker";
 import { recordWorkerHeartbeat } from "@/lib/ops/worker-health";
 import { reconcileComments } from "@/lib/polling/comment-reconciler";
 import { attachPendingNextReels } from "@/lib/automation/attach-next-reel";
@@ -43,6 +43,17 @@ async function poll() {
     console.error("[DM Worker] Comment reconciliation failed:", message);
   }
 }
+
+setTimeout(() => {
+  seedTapProbes()
+    .then((seeded) => console.log(`[DM Worker] Tap probes seeded: ${seeded}`))
+    .catch((error) =>
+      console.error(
+        "[DM Worker] Tap probe seeding failed:",
+        error instanceof Error ? error.message : "Unknown error"
+      )
+    );
+}, 5_000);
 
 // Kick off one sweep shortly after boot, then on a fixed interval.
 setTimeout(() => void poll(), 10_000);

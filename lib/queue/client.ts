@@ -54,6 +54,12 @@ export interface ProcessPostbackJob {
   // How many delayed re-checks have run, counting this one. Absent on jobs
   // queued before re-checks were counted, where `followRecheck` meant one.
   followRecheckAttempt?: number;
+  // Tap probe: without live webhooks (Standard Access) a button tap never
+  // reaches us, but it does open the 24-hour messaging window. A probe tries
+  // the reveal on a schedule and treats a closed window as "not tapped yet".
+  probe?: boolean;
+  probeAttempt?: number;
+  probeStartedAt?: number;
 }
 
 // Scheduled after the link is delivered, to send the appreciation follow-up.
