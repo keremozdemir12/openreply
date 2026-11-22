@@ -1878,3 +1878,17 @@ it("retains the public reply claim if sending succeeded but its log write failed
   expect(sendCommentReply).toHaveBeenCalledTimes(1);
   expect(mockSendPrivateReply).toHaveBeenCalledTimes(1);
 });
+
+it("rotates public reply variations in order instead of repeating one", async () => {
+  const { sendCommentReply } = await import("@/lib/meta/client");
+  vi.mocked(sendCommentReply).mockResolvedValue({ id: "public-reply" });
+  let turn = 0;
+  vi.mocked(getRedisConnection).mockReturnValue({ incr: vi.fn(async () => ++turn) } as never);
+  mockPrisma.automation.findMany.mockResolvedValue([{ ...mockAutomation, publicReplyEnabled: true, publicReplyMessages: ["A", "B", "C"] }]);
+  const process = getProcessor();
+  for (const id of ["c1", "c2", "c3", "c4"]) {
+    await process({ ...createMockJob({ ...mockJobData, commentId: id }), id });
+  }
+  const sent = vi.mocked(sendCommentReply).mock.calls.map((call) => call[2]);
+  expect(sent).toEqual(["A", "B", "C", "A"]);
+});

@@ -205,6 +205,24 @@ export async function scheduleTapProbe(
  * again, which is far better than spamming someone who already received it.
  */
 
+// Public replies rotate through a campaign's variations in order, so two
+// back-to-back replies never repeat. INCR is atomic, so jobs running at the
+// same time still get different slots. Without Redis it falls back to random.
+async function pickPublicReply(
+  automationId: string,
+  pool: string[],
+): Promise<string> {
+  if (pool.length === 1) return pool[0];
+  try {
+    const turn = await getRedisConnection().incr(
+      `public-reply-turn:${automationId}`,
+    );
+    return pool[(turn - 1) % pool.length];
+  } catch {
+    return pool[Math.floor(Math.random() * pool.length)];
+  }
+}
+
 function formatError(error: unknown): string {
   if (error instanceof MetaApiError) {
     return `${error.name} ${error.code}: ${error.message}`;
@@ -564,7 +582,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
       await claimCommentDelivery(automation.id, commentId, "public")
     ) {
       try {
-        const chosen = replyPool[Math.floor(Math.random() * replyPool.length)];
+        const chosen = await pickPublicReply(automation.id, replyPool);
         const publicReply = renderMessageWithTracking({
           message: chosen,
           commenterName,
